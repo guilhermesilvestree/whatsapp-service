@@ -1,392 +1,247 @@
 // src/services/whatsapp.client.js
-
-// === Dependências ===
-const makeWASocket = require("@whiskeysockets/baileys").default;
-const {
+const { 
+  default: makeWASocket, 
+  useMultiFileAuthState, 
   DisconnectReason,
-  useMultiFileAuthState,
-  Browsers,
-} = require("@whiskeysockets/baileys");
-
-const qrcode = require("qrcode");
-const mongoose = require("mongoose");
-const path = require("path");
-const os = require("os");
-const fs = require("fs");
+  fetchLatestBaileysVersion 
+} = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode');
+const mongoose = require('mongoose');
+const path = require('path');
+const os = require('os');
+const fs = require('fs');
+const p = require('pino'); // Logger leve do Baileys
 
 // --- Armazenamento Global ---
-const clients = new Map();     // clinicId -> socket Baileys
-const qrCodes = new Map();     // clinicId -> dataURL do QR
-const creatingQr = new Map();  // clinicId -> boolean (QR em criação)
-let mongoStore;                // Mantido por compatibilidade com a API antiga
+const clients = new Map(); // Armazena instâncias do socket por clinicId
+const qrCodes = new Map(); // Armazena QR codes (string) por clinicId
+const creatingQr = new Map(); // Flag para indicar que um QR está sendo gerado
 
-// === Helpers ===
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-const ensureDir = (dir) => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+// --- Inicialização do MongoStore (agora com Baileys + MultiFileAuthState no tmp) ---
+const initializeMongoStore = () => {
+  if (!mongoose.connection.readyState || mongoose.connection.readyState === 0 || mongoose.connection.readyState === 3) {
+    console.error("Mongoose não está conectado. Não foi possível inicializar o MongoStore.");
+    return false;
+  }
+  return true; // Baileys não usa MongoStore diretamente, mas mantemos para compatibilidade
 };
 
-const safeDeleteMaps = (id) => {
-  qrCodes.delete(id);
-  creatingQr.delete(id);
-};
-
-const mapBaileysToStatus = (sockWrapper) => {
-  if (!sockWrapper) return "disconnected";
-  const { state, hasInfo } = sockWrapper;
-  if (qrCodes.has(sockWrapper.id)) return "qrcode_pending";
-  if (creatingQr.has(sockWrapper.id)) return "creating_qr";
-  if (hasInfo) return "connected";
-  if (state === "connecting" || state === "qr" || state === "starting")
-    return "initializing";
+// --- Obter Status do Cliente ---
+const getClientStatus = (clinicId) => {
+  const id = clinicId.toString();
+  const client = clients.get(id);
+  if (!client) return "disconnected";
+  if (qrCodes.has(id)) return "qrcode_pending";
+  if (creatingQr.has(id)) return "creating_qr";
+  if (client.user) return "connected";
+  if (client.ws && client.ws.readyState === 1) return "initializing";
   return "disconnected";
 };
 
-const formatJid = (number) => {
-  // Aceita @c.us (wwebjs) e converte para @s.whatsapp.net (Baileys)
-  if (number.endsWith("@s.whatsapp.net")) return number;
-  if (number.endsWith("@c.us"))
-    return number.replace("@c.us", "@s.whatsapp.net");
-  return `${number}@s.whatsapp.net`;
-};
-
-// === Inicialização do MongoStore (compat) ===
-const initializeMongoStore = () => {
-  // Mantemos a checagem para compatibilidade com o antigo RemoteAuth,
-  // ainda que Baileys use auth em disco por padrão neste serviço.
-  if (
-    !mongoose.connection.readyState ||
-    mongoose.connection.readyState === 0 ||
-    mongoose.connection.readyState === 3
-  ) {
-    console.error(
-      "Mongoose não está conectado. Não foi possível inicializar o MongoStore."
-    );
-    return false;
-  }
-  if (!mongoStore) {
-    try {
-      // Compat placeholder: ficamos só com o ponteiro setado para indicar "ok"
-      mongoStore = { ok: true };
-      console.log(
-        "MongoStore (compat) para sessões WhatsApp marcado como inicializado."
-      );
-      return true;
-    } catch (error) {
-      console.error("Erro ao criar MongoStore (compat):", error);
-      return false;
-    }
-  }
-  return true;
-};
-
-// === Status do Cliente ===
-const getClientStatus = (clinicId) => {
-  const id = clinicId.toString();
-  const wrapper = clients.get(id);
-  if (!wrapper) return "disconnected";
-  return mapBaileysToStatus(wrapper);
-};
-
-// === Logout e Remoção ===
+// --- Logout e Remoção ---
 const logoutAndRemoveClient = async (clinicId) => {
   const id = clinicId.toString();
-  const wrapper = clients.get(id);
-
-  if (wrapper) {
-    const { sock } = wrapper;
-    console.log(
-      `[CLIENT ${id}] Iniciando logout e remoção... Estado atual: ${wrapper.state}`
-    );
-
+  const client = clients.get(id);
+  if (client) {
+    console.log(`[CLIENT ${id}] Iniciando logout e remoção...`);
     try {
-      if (sock?.logout) {
-        await sock.logout();
+      if (client.ws && client.ws.readyState === 1) {
+        await client.logout();
         console.log(`[CLIENT ${id}] Logout realizado.`);
       }
-    } catch (err) {
-      console.warn(
-        `[CLIENT ${id}] Erro (seguro) durante logout: ${err.message}`
-      );
+    } catch (error) {
+      console.warn(`[CLIENT ${id}] Erro durante logout: ${error.message}`);
     }
-
     try {
-      // Fecha conexão WS, remove listeners
-      if (sock?.ws?.close) sock.ws.close();
-      if (sock?.ev?.removeAllListeners) sock.ev.removeAllListeners();
-      console.log(`[CLIENT ${id}] Socket encerrado.`);
-    } catch (err) {
-      console.warn(
-        `[CLIENT ${id}] Erro (seguro) ao encerrar socket: ${err.message}`
-      );
+      client.end();
+    } catch (error) {
+      console.warn(`[CLIENT ${id}] Erro ao finalizar socket: ${error.message}`);
     } finally {
       clients.delete(id);
     }
   } else {
-    console.log(
-      `[CLIENT ${id}] Cliente não encontrado na memória para logout/remoção.`
-    );
+    console.log(`[CLIENT ${id}] Cliente não encontrado na memória para logout/remoção.`);
   }
-
-  safeDeleteMaps(id);
+  qrCodes.delete(id);
+  creatingQr.delete(id);
   console.log(`[CLIENT ${id}] Cliente removido e limpo da memória.`);
 };
 
-// === Inicialização do Cliente (Baileys) ===
+// --- Limpeza do diretório de sessão ---
+const clearSessionDir = (dirPath) => {
+  if (fs.existsSync(dirPath)) {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+    console.log(`[SESSION] Diretório de sessão limpo: ${dirPath}`);
+  }
+};
+
+// --- Inicialização do Cliente com Baileys ---
 const initializeClient = async (clinicId) => {
   const id = clinicId.toString();
   console.log(`[CLIENT ${id}] Iniciando processo de inicialização...`);
 
-  // Se já existe na memória, decide conforme status
+  // Verifica cliente existente
   if (clients.has(id)) {
-    const existing = clients.get(id);
+    const existingClient = clients.get(id);
     const status = getClientStatus(id);
-    console.log(
-      `[CLIENT ${id}] Cliente já existe na memória. Status: ${status}, State: ${existing.state}`
-    );
-    if (
-      status === "connected" ||
-      status === "initializing" ||
-      status === "creating_qr" ||
-      status === "qrcode_pending"
-    ) {
+    console.log(`[CLIENT ${id}] Cliente já existe. Status: ${status}`);
+    if (['connected', 'initializing', 'creating_qr', 'qrcode_pending'].includes(status)) {
       console.log(`[CLIENT ${id}] Retornando cliente existente.`);
-      return existing.sock;
+      return existingClient;
     } else {
-      console.log(
-        `[CLIENT ${id}] Cliente em estado inválido (${status}). Removendo antes de recriar.`
-      );
+      console.log(`[CLIENT ${id}] Cliente em estado inválido (${status}). Forçando remoção.`);
       await logoutAndRemoveClient(id);
     }
   }
 
-  if (!mongoStore && !initializeMongoStore()) {
-    throw new Error(
-      "MongoStore não pôde ser inicializado. Verifique a conexão com o MongoDB."
-    );
+  if (!initializeMongoStore()) {
+    throw new Error("MongoStore não pôde ser inicializado. Verifique a conexão com o MongoDB.");
   }
 
-  // Marca flag de criação de QR antes de iniciar
   creatingQr.set(id, true);
   console.log(`[CLIENT ${id}] Marcando criação de QR code.`);
 
-  // Caminho de sessão em disco (persistência)
-  const dataPath = path.resolve(`.baileys_auth/session-${id}`);
-  ensureDir(dataPath);
-  console.log(`[CLIENT ${id}] Usando dataPath: ${dataPath}`);
+  // --- Diretório de autenticação ---
+  const sessionPath = path.join(os.tmpdir(), ".wwebjs_auth", `session-${id}`);
+  if (!fs.existsSync(sessionPath)) {
+    fs.mkdirSync(sessionPath, { recursive: true });
+    console.log(`[CLIENT ${id}] Diretório de sessão criado: ${sessionPath}`);
+  } else {
+    console.log(`[CLIENT ${id}] Usando diretório de sessão existente: ${sessionPath}`);
+  }
 
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
 
-  // Auth em disco (multi-file)
-  const { state, saveCreds } = await useMultiFileAuthState(dataPath);
+  let client;
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    console.log(`[CLIENT ${id}] Usando Baileys versão: ${version.join('.')}`);
 
-  // Wrapper para guardar metadados de status
-  const wrapper = {
-    id,
-    sock: null,
-    state: "starting",
-    hasInfo: false,
-  };
+    client = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: false,
+      logger: p({ level: 'silent' }),
+      browser: ['Chrome (Linux)', '', ''],
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+    });
 
-  // Cria o socket Baileys
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    logger: undefined,
-    browser: Browsers.macOS("Chrome"),
-    syncFullHistory: false,
-  });
+    clients.set(id, client);
+    console.log(`[CLIENT ${id}] Instância do socket criada.`);
 
-  // Atribui no wrapper e salva no mapa
-  wrapper.sock = sock;
-  clients.set(id, wrapper);
+    // --- Eventos ---
+    client.ev.on('creds.update', saveCreds);
 
-  // === Eventos ===
-  // QR
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    client.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr: qrString } = update;
 
-    if (qr) {
-      try {
-        console.log(`[CLIENT ${id}] Evento QR recebido.`);
-        const qrDataUrl = await qrcode.toDataURL(qr);
-        qrCodes.set(id, qrDataUrl);
-        creatingQr.delete(id);
-        wrapper.state = "qr";
-        console.log(
-          `[CLIENT ${id}] QR code gerado e armazenado. Flag 'creatingQr' removida.`
-        );
-      } catch (qrErr) {
-        console.error(
-          `[CLIENT ${id}] Erro ao gerar QR Data URL: ${qrErr.message}`
-        );
-        creatingQr.delete(id);
-        wrapper.state = "qr_error";
+      if (qrString) {
+        console.log(`[CLIENT ${id}] QR code recebido.`);
+        try {
+          const qrDataUrl = await qrcode.toDataURL(qrString);
+          qrCodes.set(id, qrDataUrl);
+          creatingQr.delete(id);
+          console.log(`[CLIENT ${id}] QR code gerado e armazenado.`);
+        } catch (err) {
+          console.error(`[CLIENT ${id}] Erro ao gerar QR: ${err.message}`);
+          creatingQr.delete(id);
+        }
       }
-    }
 
-    if (connection === "open") {
-      console.log(`[CLIENT ${id}] Conexão aberta (READY).`);
-      wrapper.state = "connected";
-      wrapper.hasInfo = true;
-      safeDeleteMaps(id);
-      // Baileys não expõe pushname diretamente aqui; ok manter log enxuto
-    } else if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      console.warn(`[CLIENT ${id}] Conexão fechada. Code: ${code}`);
-      safeDeleteMaps(id);
-
-      // Decide se tenta limpeza total
-      const mustLogout =
-        code === DisconnectReason.loggedOut ||
-        code === DisconnectReason.badSession ||
-        code === DisconnectReason.restartRequired;
-
-      if (mustLogout) {
-        await logoutAndRemoveClient(id);
-      } else {
-        // Mantém cliente para possível reinit por fora
-        wrapper.state = "disconnected";
+      if (connection === 'open') {
+        console.log(`[CLIENT ${id}] Conectado com sucesso!`);
+        qrCodes.delete(id);
+        creatingQr.delete(id);
+        if (client.user) {
+          console.log(`[CLIENT ${id}] Usuário: ${client.user.id}, Nome: ${client.user.name}`);
+        }
       }
-    } else if (connection === "connecting") {
-      wrapper.state = "connecting";
-      console.log(`[CLIENT ${id}] Conectando...`);
-    }
-  });
 
-  // Credenciais: persistência
-  sock.ev.on("creds.update", saveCreds);
+      if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        console.warn(`[CLIENT ${id}] Conexão fechada: ${lastDisconnect?.error?.message || 'Desconhecido'}`);
+        qrCodes.delete(id);
+        creatingQr.delete(id);
 
-  // Eventos de mensagens/erros (logs básicos)
-  sock.ev.on("messaging-history.set", () =>
-    console.log(`[CLIENT ${id}] Histórico sincronizado (parcial).`)
-  );
-  sock.ev.on("ws.close", () =>
-    console.warn(`[CLIENT ${id}] WS fechado (ws.close).`)
-  );
-  sock.ev.on("ws.open", () => console.log(`[CLIENT ${id}] WS aberto.`));
+        if (shouldReconnect) {
+          console.log(`[CLIENT ${id}] Tentando reconectar...`);
+          setTimeout(() => initializeClient(clinicId), 3000);
+        } else {
+          console.log(`[CLIENT ${id}] Logout detectado. Limpando sessão.`);
+          clearSessionDir(sessionPath);
+          await logoutAndRemoveClient(id);
+        }
+      }
+    });
 
-  console.log(`[CLIENT ${id}] Retornando instância (inicialização em andamento).`);
-  return sock;
+    client.ev.on('messages.upsert', () => {}); // Evita erro de evento não tratado
+
+  } catch (error) {
+    console.error(`[CLIENT ${id}] Erro crítico ao criar socket: ${error.message}`);
+    creatingQr.delete(id);
+    clearSessionDir(sessionPath);
+    throw error;
+  }
+
+  console.log(`[CLIENT ${id}] Retornando instância do cliente (inicialização em andamento).`);
+  return client;
 };
 
-// === Envio de Mensagem (Baileys) ===
+// --- Envio de Mensagem ---
 const sendMessage = async (clinicId, number, message) => {
   const id = clinicId.toString();
-  const wrapper = clients.get(id);
+  let client = clients.get(id);
   let currentStatus = getClientStatus(id);
 
-  console.log(
-    `[SEND ${id}] Tentando enviar para ${number}. Status inicial: ${currentStatus}`
-  );
+  console.log(`[SEND ${id}] Tentando enviar para ${number}. Status inicial: ${currentStatus}`);
 
-  // Se não conectado, tenta aguardar/reativar logicamente (sem alterar contrato)
-  if (currentStatus !== "connected") {
-    console.warn(
-      `[SEND ${id}] Cliente não conectado (status: ${currentStatus}). Verificando instância...`
-    );
-
-    if (wrapper) {
-      if (
-        currentStatus === "initializing" ||
-        currentStatus === "creating_qr" ||
-        currentStatus === "qrcode_pending"
-      ) {
-        console.log(
-          `[SEND ${id}] Estado ${currentStatus}. Aguardando até 15s por conexão...`
-        );
-        await sleep(15000);
-        currentStatus = getClientStatus(id);
-        console.log(`[SEND ${id}] Status após aguardar: ${currentStatus}`);
-        if (currentStatus !== "connected") {
-          throw new Error(
-            `Cliente WhatsApp não conectou após ${currentStatus}. Status: ${currentStatus}`
-          );
-        }
-      } else {
-        console.warn(
-          `[SEND ${id}] Estado ${currentStatus}. Tentando reinicializar...`
-        );
-        try {
-          await initializeClient(clinicId);
-          await sleep(15000);
-          currentStatus = getClientStatus(id);
-          if (currentStatus !== "connected") {
-            throw new Error(
-              `Cliente não conectou após reinicialização forçada. Status: ${currentStatus}`
-            );
-          }
-          console.log(`[SEND ${id}] Cliente conectado após reinicialização.`);
-        } catch (initError) {
-          console.error(
-            `[SEND ${id}] Falha ao reinicializar: ${initError.message}`
-          );
-          throw new Error(`Cliente WhatsApp não conectado: ${initError.message}`);
-        }
-      }
-    } else {
-      console.warn(
-        `[SEND ${id}] Nenhuma instância encontrada. Tentando inicializar...`
-      );
-      try {
+  // Aguarda conexão
+  const waitForConnection = async () => {
+    const maxWait = 15000;
+    const start = Date.now();
+    while (Date.now() - start < maxWait) {
+      currentStatus = getClientStatus(id);
+      if (currentStatus === 'connected') break;
+      if (currentStatus === 'disconnected') {
+        if (client) await logoutAndRemoveClient(id);
         await initializeClient(clinicId);
-        await sleep(15000);
-        currentStatus = getClientStatus(id);
-        if (currentStatus !== "connected") {
-          throw new Error(
-            `Cliente não conectou após inicialização inicial. Status: ${currentStatus}`
-          );
-        }
-        console.log(`[SEND ${id}] Cliente conectado após inicialização inicial.`);
-      } catch (initError) {
-        console.error(
-          `[SEND ${id}] Falha ao inicializar: ${initError.message}`
-        );
-        throw new Error(`Cliente WhatsApp não conectado: ${initError.message}`);
       }
+      await new Promise(r => setTimeout(r, 1000));
     }
+    currentStatus = getClientStatus(id);
+    if (currentStatus !== 'connected') {
+      throw new Error(`Timeout: Cliente não conectou após ${maxWait}ms. Status: ${currentStatus}`);
+    }
+  };
+
+  if (currentStatus !== 'connected') {
+    console.log(`[SEND ${id}] Cliente não conectado. Aguardando...`);
+    await waitForConnection();
   }
 
-  // Releitura do wrapper (pode ter sido recriado)
-  const finalWrapper = clients.get(id);
-  if (!finalWrapper || getClientStatus(id) !== "connected") {
-    throw new Error(
-      `Erro inesperado: Cliente não disponível ou não conectado após verificações.`
-    );
+  client = clients.get(id);
+  if (!client || !client.user) {
+    throw new Error("Cliente não está conectado ou não autenticado.");
   }
 
-  const chatJid = formatJid(number);
+  const chatId = number.endsWith('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
 
   try {
-    console.log(`[SEND ${id}] Enviando para jid ${chatJid}...`);
-    const result = await finalWrapper.sock.sendMessage(chatJid, {
-      text: message,
-    });
-    // Baileys retorna objeto com key.id
-    const sentId = result?.key?.id || "unknown";
-    console.log(
-      `[SEND ${id}] Mensagem enviada com sucesso para ${number}. ID: ${sentId}`
-    );
+    console.log(`[SEND ${id}] Enviando para ${chatId}...`);
+    const result = await client.sendMessage(chatId, { text: message });
+    console.log(`[SEND ${id}] Mensagem enviada com sucesso. ID: ${result.key.id}`);
     return result;
   } catch (error) {
-    console.error(`[SEND ${id}] Falha ao enviar mensagem para ${number}:`, error);
-
-    const msg = String(error?.message || "");
-    if (
-      msg.includes("connection closed") ||
-      msg.includes("timed out") ||
-      msg.includes("disconnected")
-    ) {
-      console.warn(
-        `[SEND ${id}] Erro indica desconexão ou instabilidade. Limpando cliente.`
-      );
+    console.error(`[SEND ${id}] Falha ao enviar mensagem:`, error.message);
+    if (error.message.includes('not logged in') || error.message.includes('connection closed')) {
       await logoutAndRemoveClient(clinicId);
     }
-    throw new Error(`Falha ao enviar mensagem: ${msg || "erro desconhecido"}`);
+    throw new Error(`Falha ao enviar mensagem: ${error.message}`);
   }
 };
 
-// === Exports ===
+// --- Exports ---
 module.exports = {
   initializeMongoStore,
   initializeClient,

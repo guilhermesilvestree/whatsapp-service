@@ -6,22 +6,21 @@ const whatsappRoutes = require('./routes/whatsapp.routes');
 const app = express();
 
 // Middlewares Globais
-app.use(cors());
-app.use(express.json());
+app.use(cors()); // Permite requisições de origens diferentes (necessário para a api-clinic)
+app.use(express.json()); // Habilita o parsing de JSON no corpo das requisições
 
-// Rota de Health Check (opcional, mas útil)
 app.get('/health', (req, res) => {
   res.status(200).send('WhatsApp Service OK');
 });
 
-app.use('/', whatsappRoutes);
+app.use('/', whatsappRoutes); // Monta as rotas do WhatsApp na raiz ou em /api/whatsapp, etc.
 
 app.use((err, req, res, next) => {
   console.error("Erro não tratado:", err.stack || err.message);
   const statusCode = err.statusCode || 500;
   res.status(statusCode).json({
     message: err.message || 'Erro interno no servidor.',
-    stack: process.env.NODE_ENV === 'production' ? null : err.stack,
+    // stack: process.env.NODE_ENV === 'production' ? null : err.stack, // Opcional: não expor stack em produção
   });
 });
 
