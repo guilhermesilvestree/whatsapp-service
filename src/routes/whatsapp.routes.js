@@ -56,11 +56,10 @@ router.post('/send-message', asyncHandler(async (req, res) => {
     }
     try {
         const result = await whatsappClient.sendMessage(req.clinicId, to, message);
-        // Retorna alguma confirmação ou o ID da mensagem se possível
         res.status(200).json({ message: 'Mensagem enviada para a fila.', result: { id: result.id } });
     } catch (error) {
         console.error(`[SEND_MESSAGE ${req.clinicId}] Erro: ${error.message}`);
-        res.status(400).json({ message: error.message || 'Erro ao enviar mensagem.' }); // Retorna o erro do whatsapp.client
+        res.status(400).json({ message: error.message || 'Erro ao enviar mensagem.' }); 
     }
 }));
 

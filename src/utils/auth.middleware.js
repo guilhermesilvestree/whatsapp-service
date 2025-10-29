@@ -2,6 +2,12 @@
 const jwt = require('jsonwebtoken');
 
 exports.verifyServiceToken = (req, res, next) => {
+  if (process.env.NODE_ENV === 'development') {
+    req.clinicId = process.env.DEV_CLINIC_ID || 'dev-clinic';
+    console.log(req.clinicId)
+    return next();
+  }
+
   const authHeader = req.headers.authorization;
   let token;
 
