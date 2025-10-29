@@ -50,7 +50,7 @@ router.post('/logout', asyncHandler(async (req, res) => {
 }));
 
 router.post('/send-message', asyncHandler(async (req, res) => {
-    const { to, message } = req.body;
+    let { to, message } = req.body;
 
     // Log de debug: recebimento de requisição
     console.log(`[SEND_MESSAGE][${req.clinicId}] Requisição recebida:`, {
@@ -62,6 +62,10 @@ router.post('/send-message', asyncHandler(async (req, res) => {
         console.warn(`[SEND_MESSAGE][${req.clinicId}] Parâmetros ausentes. Body recebido:`, req.body);
         return res.status(400).json({ message: 'Parâmetros "to" e "message" são obrigatórios.' });
     }
+
+    // Garante que o número tenha prefixo 55, mas sem duplicar
+    to = to.toString().replace(/^(\+?55)?/, ''); // Remove +55 ou 55 no começo
+    to = '55' + to; // Adiciona 55 no começo
 
     try {
         const result = await whatsappClient.sendMessage(req.clinicId, to, message);
