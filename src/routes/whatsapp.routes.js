@@ -51,14 +51,31 @@ router.post('/logout', asyncHandler(async (req, res) => {
 
 router.post('/send-message', asyncHandler(async (req, res) => {
     const { to, message } = req.body;
+
+    // Log de debug: recebimento de requisição
+    console.log(`[SEND_MESSAGE][${req.clinicId}] Requisição recebida:`, {
+        body: req.body,
+        clinicId: req.clinicId
+    });
+
     if (!to || !message) {
+        console.warn(`[SEND_MESSAGE][${req.clinicId}] Parâmetros ausentes. Body recebido:`, req.body);
         return res.status(400).json({ message: 'Parâmetros "to" e "message" são obrigatórios.' });
     }
+
     try {
         const result = await whatsappClient.sendMessage(req.clinicId, to, message);
+        console.log(`[SEND_MESSAGE][${req.clinicId}] Mensagem enviada com sucesso. ID: ${result.id}`);
         res.status(200).json({ message: 'Mensagem enviada para a fila.', result: { id: result.id } });
     } catch (error) {
-        console.error(`[SEND_MESSAGE ${req.clinicId}] Erro: ${error.message}`);
+        // Log detalhado do erro e do que foi recebido
+        console.error(`[SEND_MESSAGE][${req.clinicId}] ERRO ao enviar mensagem:`, {
+            error: error.message,
+            stack: error.stack,
+            params: { to, message },
+            clinicId: req.clinicId,
+            body: req.body
+        });
         res.status(400).json({ message: error.message || 'Erro ao enviar mensagem.' });
     }
 }));
