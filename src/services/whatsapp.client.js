@@ -8,7 +8,7 @@ const {
 const qrcode = require('qrcode');
 const mongoose = require('mongoose');
 const path = require('path');
-const os = require('os');
+// const os = require('os'); // <--- REMOVIDO (não é mais necessário)
 const fs = require('fs');
 const p = require('pino'); // Logger leve do Baileys
 
@@ -17,7 +17,7 @@ const clients = new Map(); // Armazena instâncias do socket por clinicId
 const qrCodes = new Map(); // Armazena QR codes (string) por clinicId
 const creatingQr = new Map(); // Flag para indicar que um QR está sendo gerado
 
-// --- Inicialização do MongoStore (agora com Baileys + MultiFileAuthState no tmp) ---
+// --- Inicialização do MongoStore ---
 const initializeMongoStore = () => {
   if (!mongoose.connection.readyState || mongoose.connection.readyState === 0 || mongoose.connection.readyState === 3) {
     console.error("Mongoose não está conectado. Não foi possível inicializar o MongoStore.");
@@ -101,8 +101,9 @@ const initializeClient = async (clinicId) => {
   creatingQr.set(id, true);
   console.log(`[CLIENT ${id}] Marcando criação de QR code.`);
 
-  // --- Diretório de autenticação ---
-  const sessionPath = path.join(os.tmpdir(), ".wwebjs_auth", `session-${id}`);
+  // --- Diretório de autenticação (CORRIGIDO PARA A RAIZ DO PROJETO) ---
+  const sessionPath = path.resolve(".baileys_auth", `session-${id}`);
+  
   if (!fs.existsSync(sessionPath)) {
     fs.mkdirSync(sessionPath, { recursive: true });
     console.log(`[CLIENT ${id}] Diretório de sessão criado: ${sessionPath}`);

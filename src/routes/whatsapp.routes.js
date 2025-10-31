@@ -3,7 +3,10 @@ const express = require('express');
 const router = express.Router();
 const { verifyServiceToken } = require('../utils/auth.middleware');
 const whatsappClient = require('../services/whatsapp.client');
-const asyncHandler = require('../utils/asyncHandler'); // Crie este helper simples
+const asyncHandler = require('../utils/asyncHandler');
+
+const fs = require('fs').promises;
+const path = require('path');
 
 // Aplica o middleware de verificação de token em todas as rotas
 router.use(verifyServiceToken);
@@ -83,5 +86,71 @@ router.post('/send-message', asyncHandler(async (req, res) => {
         res.status(400).json({ message: error.message || 'Erro ao enviar mensagem.' });
     }
 }));
+
+// === INÍCIO DAS ROTAS ADICIONAIS ===
+
+/**
+ * Rota para listar todas as conexões ativas na memória.
+ */
+router.get('/connections', asyncHandler(async (req, res) => {
+    const connections = [];
+    const clientIds = whatsappClient.clients.keys();
+    
+    for (const id of clientIds) {
+        const status = whatsappClient.getClientStatus(id);
+        connections.push({ clinicId: id, status });
+    }
+
+    res.status(200).json({
+        count: connections.length,
+        connections
+    });
+}));
+
+
+/**
+ * Rota para DELETAR TODAS AS SESSÕES (memória e disco).
+ */
+router.post('/delete-all-sessions', asyncHandler(async (req, res) => {
+    console.log(`[DELETE-ALL] Iniciando exclusão total de TODAS as sessões...`);
+
+    // 1. Desconectar todos os clientes da memória
+    const clientIds = Array.from(whatsappClient.clients.keys());
+    console.log(`[DELETE-ALL] Desconectando ${clientIds.length} clientes da memória...`);
+    
+    await Promise.all(
+        clientIds.map(id => whatsappClient.logoutAndRemoveClient(id))
+    );
+    
+    console.log(`[DELETE-ALL] Clientes em memória limpos.`);
+
+    const authRootPath = path.resolve(".baileys_auth");
+
+    try {
+        await fs.rm(authRootPath, { recursive: true, force: true });
+        console.log(`[DELETE-ALL] Pasta ${authRootPath} removida do disco.`);
+        res.status(200).json({
+            status: "deleted_all",
+            message: `Todas as sessões (${clientIds.length}) foram desconectadas e a pasta de autenticação (${authRootPath}) foi removida.`
+        });
+    } catch (error) {
+        // Trata erro caso a pasta não exista
+        if (error.code === 'ENOENT') {
+             console.warn(`[DELETE-ALL] Pasta ${authRootPath} não encontrada (provavelmente já removida).`);
+             return res.status(200).json({
+                status: "deleted_all",
+                message: `Sessões em memória limpas (pasta de autenticação ${authRootPath} já não existia).`
+            });
+        }
+        // Outro erro de remoção
+        console.error(`[DELETE-ALL] Erro ao remover pasta ${authRootPath}:`, error);
+        res.status(500).json({
+            status: "error",
+            message: `Sessões em memória limpas, mas falha ao remover pasta (${authRootPath}) do disco: ${error.message}`
+        });
+    }
+}));
+
+// === FIM DAS ROTAS ADICIONAIS ===
 
 module.exports = router;
