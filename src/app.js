@@ -2,6 +2,7 @@
 const express = require('express');
 const cors = require('cors');
 const whatsappRoutes = require('./routes/whatsapp.routes');
+const adminRoutes = require('./routes/admin.routes'); // <-- ADICIONAR ESTA LINHA
 
 const app = express();
 
@@ -13,6 +14,7 @@ app.get('/health', (req, res) => {
   res.status(200).send('WhatsApp Service OK');
 });
 
+app.use('/admin', adminRoutes); // <-- ADICIONAR ESTA LINHA
 app.use('/', whatsappRoutes); // Monta as rotas do WhatsApp na raiz ou em /api/whatsapp, etc.
 
 app.use((err, req, res, next) => {

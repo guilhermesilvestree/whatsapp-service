@@ -16,6 +16,7 @@ const p = require('pino'); // Logger leve do Baileys
 const clients = new Map(); // Armazena instâncias do socket por clinicId
 const qrCodes = new Map(); // Armazena QR codes (string) por clinicId
 const creatingQr = new Map(); // Flag para indicar que um QR está sendo gerado
+const ADMIN_CLIENT_ID = 'admin'; // O ID estático para o cliente admin
 
 // --- Inicialização do MongoStore ---
 const initializeMongoStore = () => {
@@ -242,6 +243,39 @@ const sendMessage = async (clinicId, number, message) => {
   }
 };
 
+const initializeAdminClient = async () => {
+  console.log(`[CLIENT ${ADMIN_CLIENT_ID}] Inicializando cliente admin...`);
+  // A função initializeClient já cuida de não recriar se estiver conectado
+  return initializeClient(ADMIN_CLIENT_ID);
+};
+
+/**
+ * Retorna o status atual do cliente admin.
+ */
+const getAdminClientStatus = () => {
+  return getClientStatus(ADMIN_CLIENT_ID);
+};
+
+/**
+ * Retorna o QR Code do admin, se existir.
+ */
+const getAdminQrCode = () => {
+    if (qrCodes.has(ADMIN_CLIENT_ID)) {
+        return qrCodes.get(ADMIN_CLIENT_ID);
+    }
+    return null;
+};
+
+/**
+ * Envia uma mensagem usando o cliente admin.
+ * Tenta (re)inicializar se não estiver conectado.
+ */
+const sendAdminMessage = async (number, message) => {
+  console.log(`[SEND ${ADMIN_CLIENT_ID}] Enviando mensagem admin para ${number}`);
+  // A função sendMessage já cuida de (re)inicializar se necessário
+  return sendMessage(ADMIN_CLIENT_ID, number, message);
+};
+
 // --- Exports ---
 module.exports = {
   initializeMongoStore,
@@ -251,4 +285,10 @@ module.exports = {
   sendMessage,
   clients,
   qrCodes,
+  
+  ADMIN_CLIENT_ID,
+  initializeAdminClient,
+  getAdminClientStatus,
+  getAdminQrCode,
+  sendAdminMessage,
 };
