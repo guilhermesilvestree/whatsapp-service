@@ -8,71 +8,131 @@ const {
 const qrcode = require('qrcode');
 const mongoose = require('mongoose');
 const path = require('path');
-// const os = require('os'); // <--- REMOVIDO (não é mais necessário)
 const fs = require('fs');
-const p = require('pino'); // Logger leve do Baileys
+const p = require('pino');
 
+
+// --- Funções auxiliares ---
 // --- Armazenamento Global ---
-const clients = new Map(); // Armazena instâncias do socket por clinicId
+const clients = new Map(); // Armazena instâncias do socket por clinicId (valor = socket)
 const qrCodes = new Map(); // Armazena QR codes (string) por clinicId
 const creatingQr = new Map(); // Flag para indicar que um QR está sendo gerado
 const ADMIN_CLIENT_ID = 'admin'; // O ID estático para o cliente admin
 
-// --- Inicialização do MongoStore ---
+// --- Inicialização do MongoStore (placeholder) ---
 const initializeMongoStore = () => {
   if (!mongoose.connection.readyState || mongoose.connection.readyState === 0 || mongoose.connection.readyState === 3) {
     console.error("Mongoose não está conectado. Não foi possível inicializar o MongoStore.");
     return false;
   }
-  return true; // Baileys não usa MongoStore diretamente, mas mantemos para compatibilidade
+  return true;
 };
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const ensureDir = (dir) => {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+};
+
 
 // --- Obter Status do Cliente ---
 const getClientStatus = (clinicId) => {
   const id = clinicId.toString();
-  const client = clients.get(id);
-  if (!client) return "disconnected";
-  if (qrCodes.has(id)) return "qrcode_pending";
-  if (creatingQr.has(id)) return "creating_qr";
-  if (client.user) return "connected";
-  if (client.ws && client.ws.readyState === 1) return "initializing";
+  const client = clients.get(id); // 1. Tenta buscar na memória
+
+  if (client) {
+    if (qrCodes.has(id)) return "qrcode_pending";
+    if (creatingQr.has(id)) return "creating_qr";
+    if (client.user) return "connected"; // <-- Conexão ativa
+    if (client.ws && client.ws.readyState === 1) return "initializing";
+  }
+
+  const sessionPath = path.resolve(".baileys_auth", `session-${id}`);
+  
+  if (fs.existsSync(sessionPath)) {
+    return "connected";
+  }
+
+  // 4. Se não achou na memória NEM no disco
   return "disconnected";
+};
+
+const safeDeleteMaps = (id) => {
+  qrCodes.delete(id);
+  creatingQr.delete(id);
 };
 
 // --- Logout e Remoção ---
 const logoutAndRemoveClient = async (clinicId) => {
   const id = clinicId.toString();
-  const client = clients.get(id);
-  if (client) {
-    console.log(`[CLIENT ${id}] Iniciando logout e remoção...`);
+  const wrapper = clients.get(id);
+
+  if (wrapper) {
+    const { sock } = wrapper;
+    console.log(
+      `[CLIENT ${id}] Iniciando logout e remoção... Estado atual: ${wrapper.state}`
+    );
+
     try {
-      if (client.ws && client.ws.readyState === 1) {
-        await client.logout();
+      if (sock?.logout) {
+        await sock.logout();
         console.log(`[CLIENT ${id}] Logout realizado.`);
       }
-    } catch (error) {
-      console.warn(`[CLIENT ${id}] Erro durante logout: ${error.message}`);
+    } catch (err) {
+      console.warn(
+        `[CLIENT ${id}] Erro (seguro) durante logout: ${err.message}`
+      );
     }
+
     try {
-      client.end();
-    } catch (error) {
-      console.warn(`[CLIENT ${id}] Erro ao finalizar socket: ${error.message}`);
+      // Fecha conexão WS, remove listeners
+      if (sock?.ws?.close) sock.ws.close();
+      if (sock?.ev?.removeAllListeners) sock.ev.removeAllListeners();
+      console.log(`[CLIENT ${id}] Socket encerrado.`);
+    } catch (err) {
+      console.warn(
+        `[CLIENT ${id}] Erro (seguro) ao encerrar socket: ${err.message}`
+      );
     } finally {
       clients.delete(id);
     }
   } else {
-    console.log(`[CLIENT ${id}] Cliente não encontrado na memória para logout/remoção.`);
+    console.log(
+      `[CLIENT ${id}] Cliente não encontrado na memória para logout/remoção.`
+    );
   }
-  qrCodes.delete(id);
-  creatingQr.delete(id);
+
+  safeDeleteMaps(id); // Limpa QR codes e flags de criação
+
+  // --- INÍCIO DA MODIFICAÇÃO ---
+  // Adicione este bloco para limpar o diretório da sessão
+  const dataPath = path.resolve(`.baileys_auth/session-${id}`);
+  
+  if (fs.existsSync(dataPath)) {
+    try {
+      // Usamos rmSync (síncrono) para garantir que a pasta seja removida
+      // antes da função terminar.
+      fs.rmSync(dataPath, { recursive: true, force: true });
+      console.log(`[CLIENT ${id}] Pasta de sessão (${dataPath}) removida do disco.`);
+    } catch (err) {
+      console.error(
+        `[CLIENT ${id}] Falha ao remover pasta de sessão (${dataPath}): ${err.message}`
+      );
+    }
+  }
+  // --- FIM DA MODIFICAÇÃO ---
+
   console.log(`[CLIENT ${id}] Cliente removido e limpo da memória.`);
 };
-
 // --- Limpeza do diretório de sessão ---
 const clearSessionDir = (dirPath) => {
   if (fs.existsSync(dirPath)) {
-    fs.rmSync(dirPath, { recursive: true, force: true });
-    console.log(`[SESSION] Diretório de sessão limpo: ${dirPath}`);
+    try {
+      fs.rmSync(dirPath, { recursive: true, force: true });
+      console.log(`[SESSION] Diretório de sessão limpo: ${dirPath}`);
+    } catch (err) {
+      console.warn(`[SESSION] Falha ao remover diretório ${dirPath}: ${err.message}`);
+    }
   }
 };
 
@@ -102,9 +162,8 @@ const initializeClient = async (clinicId) => {
   creatingQr.set(id, true);
   console.log(`[CLIENT ${id}] Marcando criação de QR code.`);
 
-  // --- Diretório de autenticação (CORRIGIDO PARA A RAIZ DO PROJETO) ---
+  // Diretório de autenticação (na raiz do projeto)
   const sessionPath = path.resolve(".baileys_auth", `session-${id}`);
-  
   if (!fs.existsSync(sessionPath)) {
     fs.mkdirSync(sessionPath, { recursive: true });
     console.log(`[CLIENT ${id}] Diretório de sessão criado: ${sessionPath}`);
@@ -129,8 +188,9 @@ const initializeClient = async (clinicId) => {
       markOnlineOnConnect: false,
     });
 
+    // Salva a instância do socket (valor = socket)
     clients.set(id, client);
-    console.log(`[CLIENT ${id}] Instância do socket criada.`);
+    console.log(`[CLIENT ${id}] Instância do socket criada e armazenada.`);
 
     // --- Eventos ---
     client.ev.on('creds.update', saveCreds);
@@ -156,7 +216,7 @@ const initializeClient = async (clinicId) => {
         qrCodes.delete(id);
         creatingQr.delete(id);
         if (client.user) {
-          console.log(`[CLIENT ${id}] Usuário: ${client.user.id}, Nome: ${client.user.name}`);
+          console.log(`[CLIENT ${id}] Usuário conectado: ${client.user.id}`);
         }
       }
 
@@ -167,8 +227,8 @@ const initializeClient = async (clinicId) => {
         creatingQr.delete(id);
 
         if (shouldReconnect) {
-          console.log(`[CLIENT ${id}] Tentando reconectar...`);
-          setTimeout(() => initializeClient(clinicId), 3000);
+          console.log(`[CLIENT ${id}] Tentando reconectar em 3s...`);
+          setTimeout(() => initializeClient(clinicId).catch(err => console.error(`[CLIENT ${id}] Erro ao reinicializar: ${err.message}`)), 3000);
         } else {
           console.log(`[CLIENT ${id}] Logout detectado. Limpando sessão.`);
           clearSessionDir(sessionPath);
@@ -177,12 +237,37 @@ const initializeClient = async (clinicId) => {
       }
     });
 
-    client.ev.on('messages.upsert', () => {}); // Evita erro de evento não tratado
+    // Evita erro de evento não tratado e adiciona logs para updates de mensagens
+    client.ev.on('messages.upsert', (upsert) => {
+      // upsert: { messages: [...], type: 'notify'|'append'|'...' }
+      console.log(`[CLIENT ${id}] messages.upsert type=${upsert.type} count=${upsert.messages?.length || 0}`);
+    });
+
+    // messages.update fornece status/acks/delivery/fail info
+    client.ev.on('messages.update', (updates) => {
+      for (const u of updates) {
+        try {
+          console.log(`[CLIENT ${id}] messages.update: key=${u.key?.id || 'n/a'} status=${u.status || 'n/a'} type=${u.update?.status || 'n/a'}`, u);
+        } catch (err) {
+          console.debug(`[CLIENT ${id}] messages.update logging falhou: ${err.message}`);
+        }
+      }
+    });
+
+    client.ev.on('presence.update', (p) => {
+      console.log(`[CLIENT ${id}] presence.update:`, p);
+    });
+
+    client.ev.on('chats.set', (c) => {
+      console.log(`[CLIENT ${id}] chats.set: total=${c.length}`);
+    });
 
   } catch (error) {
     console.error(`[CLIENT ${id}] Erro crítico ao criar socket: ${error.message}`);
     creatingQr.delete(id);
     clearSessionDir(sessionPath);
+    // Remove qualquer cliente parcialmente criado
+    if (clients.has(id)) clients.delete(id);
     throw error;
   }
 
@@ -207,6 +292,7 @@ const sendMessage = async (clinicId, number, message) => {
       if (currentStatus === 'connected') break;
       if (currentStatus === 'disconnected') {
         if (client) await logoutAndRemoveClient(id);
+        // inicia (não await a chamada se quiser background init) — aqui aguardamos para garantir conn
         await initializeClient(clinicId);
       }
       await new Promise(r => setTimeout(r, 1000));
@@ -232,48 +318,59 @@ const sendMessage = async (clinicId, number, message) => {
   try {
     console.log(`[SEND ${id}] Enviando para ${chatId}...`);
     const result = await client.sendMessage(chatId, { text: message });
-    console.log(`[SEND ${id}] Mensagem enviada com sucesso. ID: ${result.key.id}`);
+    console.log(`[SEND ${id}] Mensagem enviada com sucesso. ID: ${result.key?.id || 'n/a'}`);
     return result;
   } catch (error) {
-    console.error(`[SEND ${id}] Falha ao enviar mensagem:`, error.message);
-    if (error.message.includes('not logged in') || error.message.includes('connection closed')) {
-      await logoutAndRemoveClient(clinicId);
+    console.error(`[SEND ${id}] Falha ao enviar mensagem:`, error.message || error);
+    // Se erro de login/conn, limpa cliente para forçar reauth no próximo envio
+    if ((error.message && error.message.includes('not logged in')) || (error.message && error.message.includes('connection closed'))) {
+      try { await logoutAndRemoveClient(clinicId); } catch (e) { /* ignora */ }
     }
-    throw new Error(`Falha ao enviar mensagem: ${error.message}`);
+    throw new Error(`Falha ao enviar mensagem: ${error.message || String(error)}`);
   }
 };
 
+// --- Admin helpers ---
 const initializeAdminClient = async () => {
   console.log(`[CLIENT ${ADMIN_CLIENT_ID}] Inicializando cliente admin...`);
-  // A função initializeClient já cuida de não recriar se estiver conectado
   return initializeClient(ADMIN_CLIENT_ID);
 };
 
-/**
- * Retorna o status atual do cliente admin.
- */
 const getAdminClientStatus = () => {
   return getClientStatus(ADMIN_CLIENT_ID);
 };
 
-/**
- * Retorna o QR Code do admin, se existir.
- */
 const getAdminQrCode = () => {
-    if (qrCodes.has(ADMIN_CLIENT_ID)) {
-        return qrCodes.get(ADMIN_CLIENT_ID);
-    }
-    return null;
+  if (qrCodes.has(ADMIN_CLIENT_ID)) {
+    return qrCodes.get(ADMIN_CLIENT_ID);
+  }
+  return null;
+};
+
+const sendAdminMessage = async (number, message) => {
+  console.log(`[SEND ${ADMIN_CLIENT_ID}] Enviando mensagem admin para ${number}`);
+  return sendMessage(ADMIN_CLIENT_ID, number, message);
+};
+
+// --- Funções utilitárias para expor a conexão ---
+/**
+ * Retorna a instância do socket (conn) para um clinicId, ou null se não existir.
+ * Ex.: const conn = whatsappClient.getConn(clinicId);
+ */
+const getConn = (clinicId) => {
+  const id = clinicId ? clinicId.toString() : null;
+  if (!id) return null;
+  return clients.get(id) || null;
 };
 
 /**
- * Envia uma mensagem usando o cliente admin.
- * Tenta (re)inicializar se não estiver conectado.
+ * Retorna a "entry" completa do cliente — no design atual a entry é o próprio socket.
+ * Mantido para compatibilidade futura caso queira armazenar objetos { conn, status }.
  */
-const sendAdminMessage = async (number, message) => {
-  console.log(`[SEND ${ADMIN_CLIENT_ID}] Enviando mensagem admin para ${number}`);
-  // A função sendMessage já cuida de (re)inicializar se necessário
-  return sendMessage(ADMIN_CLIENT_ID, number, message);
+const getClientEntry = (clinicId) => {
+  const id = clinicId ? clinicId.toString() : null;
+  if (!id) return null;
+  return clients.get(id) || null;
 };
 
 // --- Exports ---
@@ -285,10 +382,14 @@ module.exports = {
   sendMessage,
   clients,
   qrCodes,
-  
+
   ADMIN_CLIENT_ID,
   initializeAdminClient,
   getAdminClientStatus,
   getAdminQrCode,
   sendAdminMessage,
+
+  // Exports novos
+  getConn,
+  getClientEntry,
 };
