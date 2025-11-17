@@ -44,33 +44,21 @@ router.get('/qrcode', asyncHandler(async (req, res) => {
 // === ROTA: Status do cliente ===
 router.get('/status', asyncHandler(async (req, res) => {
     const status = whatsappClient.getClientStatus(req.clinicId);
+    // Mapear status para mensagens amigáveis (como no controller original)
     let message = 'Status desconhecido.';
-    
-    switch (status) {
-      case "connected": 
-        message = "WhatsApp conectado."; 
-        break;
-      case "qrcode_pending": 
-        message = "QR Code gerado. Aguardando leitura."; 
-        break;
-      case "creating_qr": 
-        message = "Criando QR Code. Aguarde..."; 
-        break;
-      case "initializing": 
-        message = "Conexão em progresso."; 
-        break;
-      case "disconnected": 
-        message = "WhatsApp desconectado (requer novo QR Code)."; 
-        break;
-    }
-    
+     switch (status) {
+        case "connected": message = "WhatsApp conectado."; break;
+        case "qrcode_pending": message = "QR Code gerado. Aguardando leitura."; break;
+        case "creating_qr": message = "Criando QR Code. Aguarde..."; break;
+        case "initializing": message = "Conexão em progresso."; break;
+        case "disconnected": message = "WhatsApp desconhecido ou desconectado."; break;
+     }
     res.status(200).json({ status, message });
-  }));
+}));
 
-// === ROTA: Logout manual ===
 router.post('/logout', asyncHandler(async (req, res) => {
-  await whatsappClient.logoutAndRemoveClient(req.clinicId);
-  res.status(200).json({ status: "success", message: "Cliente WhatsApp desconectado." });
+    await whatsappClient.logoutAndRemoveClient(req.clinicId);
+    res.status(200).json({ status: "success", message: "Cliente WhatsApp desconectado." });
 }));
 
 // === ROTA: Enviar mensagem (sempre SEM NONO DÍGITO) ===

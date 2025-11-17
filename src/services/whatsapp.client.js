@@ -3,6 +3,7 @@ const {
   default: makeWASocket, 
   useMultiFileAuthState, 
   DisconnectReason,
+  Browsers,
   fetchLatestBaileysVersion 
 } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode');
@@ -35,105 +36,74 @@ const ensureDir = (dir) => {
 };
 
 
-// --- Obter Status do Cliente ---
+
+// === CORREÇÃO DA FUNÇÃO DE STATUS ===
 const getClientStatus = (clinicId) => {
   const id = clinicId.toString();
-  const client = clients.get(id); // 1. Tenta buscar na memória
-
-  if (client) {
-    if (qrCodes.has(id)) return "qrcode_pending";
-    if (creatingQr.has(id)) return "creating_qr";
-    if (client.user) return "connected"; // <-- Conexão ativa
-    if (client.ws && client.ws.readyState === 1) return "initializing";
-  }
-
-  const sessionPath = path.resolve(".baileys_auth", `session-${id}`);
-  
-  if (fs.existsSync(sessionPath)) {
-    return "connected";
-  }
-
-  // 4. Se não achou na memória NEM no disco
+  const client = clients.get(id);
+  if (!client) return "disconnected";
+  if (qrCodes.has(id)) return "qrcode_pending";
+  if (creatingQr.has(id)) return "creating_qr";
+  if (client.user) return "connected";
+  if (client.ws && client.ws.readyState === 1) return "initializing";
   return "disconnected";
 };
 
-const safeDeleteMaps = (id) => {
-  qrCodes.delete(id);
-  creatingQr.delete(id);
-};
-
-// --- Logout e Remoção ---
 const logoutAndRemoveClient = async (clinicId) => {
   const id = clinicId.toString();
-  const wrapper = clients.get(id);
-
-  if (wrapper) {
-    const { sock } = wrapper;
-    console.log(
-      `[CLIENT ${id}] Iniciando logout e remoção... Estado atual: ${wrapper.state}`
-    );
-
+  const client = clients.get(id);
+  if (client) {
+    console.log(`[CLIENT ${id}] Iniciando logout e remoção...`);
     try {
-      if (sock?.logout) {
-        await sock.logout();
+      if (client.ws && client.ws.readyState === 1) {
+        await client.logout();
         console.log(`[CLIENT ${id}] Logout realizado.`);
       }
-    } catch (err) {
-      console.warn(
-        `[CLIENT ${id}] Erro (seguro) durante logout: ${err.message}`
-      );
+    } catch (error) {
+      console.warn(`[CLIENT ${id}] Erro durante logout: ${error.message}`);
     }
-
     try {
-      // Fecha conexão WS, remove listeners
-      if (sock?.ws?.close) sock.ws.close();
-      if (sock?.ev?.removeAllListeners) sock.ev.removeAllListeners();
-      console.log(`[CLIENT ${id}] Socket encerrado.`);
-    } catch (err) {
-      console.warn(
-        `[CLIENT ${id}] Erro (seguro) ao encerrar socket: ${err.message}`
-      );
+      client.end();
+    } catch (error) {
+      console.warn(`[CLIENT ${id}] Erro ao finalizar socket: ${error.message}`);
     } finally {
       clients.delete(id);
     }
   } else {
-    console.log(
-      `[CLIENT ${id}] Cliente não encontrado na memória para logout/remoção.`
-    );
+    console.log(`[CLIENT ${id}] Cliente não encontrado na memória para logout/remoção.`);
   }
-
-  safeDeleteMaps(id); // Limpa QR codes e flags de criação
-
-  // --- INÍCIO DA MODIFICAÇÃO ---
-  // Adicione este bloco para limpar o diretório da sessão
-  const dataPath = path.resolve(`.baileys_auth/session-${id}`);
-  
-  if (fs.existsSync(dataPath)) {
-    try {
-      // Usamos rmSync (síncrono) para garantir que a pasta seja removida
-      // antes da função terminar.
-      fs.rmSync(dataPath, { recursive: true, force: true });
-      console.log(`[CLIENT ${id}] Pasta de sessão (${dataPath}) removida do disco.`);
-    } catch (err) {
-      console.error(
-        `[CLIENT ${id}] Falha ao remover pasta de sessão (${dataPath}): ${err.message}`
-      );
-    }
-  }
-  // --- FIM DA MODIFICAÇÃO ---
-
+  qrCodes.delete(id);
+  creatingQr.delete(id);
   console.log(`[CLIENT ${id}] Cliente removido e limpo da memória.`);
 };
+
+
 // --- Limpeza do diretório de sessão ---
 const clearSessionDir = (dirPath) => {
   if (fs.existsSync(dirPath)) {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+    console.log(`[SESSION] Diretório de sessão limpo: ${dirPath}`);
+  }
+};
+
+const cleanupClientMemory = (clinicId) => {
+  const id = clinicId.toString();
+  const client = clients.get(id);
+
+  if (client) {
+    console.log(`[CLEANUP ${id}] Limpando cliente da memória (sem logout/delete de sessão).`);
     try {
-      fs.rmSync(dirPath, { recursive: true, force: true });
-      console.log(`[SESSION] Diretório de sessão limpo: ${dirPath}`);
+      // Tenta fechar a conexão WS e remover listeners sem deslogar
+      if (client.ws?.close) client.ws.close();
+      if (client.ev?.removeAllListeners) client.ev.removeAllListeners();
     } catch (err) {
-      console.warn(`[SESSION] Falha ao remover diretório ${dirPath}: ${err.message}`);
+      console.warn(`[CLEANUP ${id}] Erro (seguro) ao fechar socket: ${err.message}`);
     }
   }
+  
+  clients.delete(id); // Remove da memória
+  safeDeleteMaps(id); // Limpa QR codes pendentes ou flags de criação
+  console.log(`[CLEANUP ${id}] Cliente removido da memória.`);
 };
 
 // --- Inicialização do Cliente com Baileys ---
@@ -162,8 +132,9 @@ const initializeClient = async (clinicId) => {
   creatingQr.set(id, true);
   console.log(`[CLIENT ${id}] Marcando criação de QR code.`);
 
-  // Diretório de autenticação (na raiz do projeto)
+  // --- Diretório de autenticação (CORRIGIDO PARA A RAIZ DO PROJETO) ---
   const sessionPath = path.resolve(".baileys_auth", `session-${id}`);
+  
   if (!fs.existsSync(sessionPath)) {
     fs.mkdirSync(sessionPath, { recursive: true });
     console.log(`[CLIENT ${id}] Diretório de sessão criado: ${sessionPath}`);
@@ -188,9 +159,8 @@ const initializeClient = async (clinicId) => {
       markOnlineOnConnect: false,
     });
 
-    // Salva a instância do socket (valor = socket)
     clients.set(id, client);
-    console.log(`[CLIENT ${id}] Instância do socket criada e armazenada.`);
+    console.log(`[CLIENT ${id}] Instância do socket criada.`);
 
     // --- Eventos ---
     client.ev.on('creds.update', saveCreds);
@@ -216,7 +186,7 @@ const initializeClient = async (clinicId) => {
         qrCodes.delete(id);
         creatingQr.delete(id);
         if (client.user) {
-          console.log(`[CLIENT ${id}] Usuário conectado: ${client.user.id}`);
+          console.log(`[CLIENT ${id}] Usuário: ${client.user.id}, Nome: ${client.user.name}`);
         }
       }
 
@@ -227,8 +197,8 @@ const initializeClient = async (clinicId) => {
         creatingQr.delete(id);
 
         if (shouldReconnect) {
-          console.log(`[CLIENT ${id}] Tentando reconectar em 3s...`);
-          setTimeout(() => initializeClient(clinicId).catch(err => console.error(`[CLIENT ${id}] Erro ao reinicializar: ${err.message}`)), 3000);
+          console.log(`[CLIENT ${id}] Tentando reconectar...`);
+          setTimeout(() => initializeClient(clinicId), 3000);
         } else {
           console.log(`[CLIENT ${id}] Logout detectado. Limpando sessão.`);
           clearSessionDir(sessionPath);
@@ -237,37 +207,12 @@ const initializeClient = async (clinicId) => {
       }
     });
 
-    // Evita erro de evento não tratado e adiciona logs para updates de mensagens
-    client.ev.on('messages.upsert', (upsert) => {
-      // upsert: { messages: [...], type: 'notify'|'append'|'...' }
-      console.log(`[CLIENT ${id}] messages.upsert type=${upsert.type} count=${upsert.messages?.length || 0}`);
-    });
-
-    // messages.update fornece status/acks/delivery/fail info
-    client.ev.on('messages.update', (updates) => {
-      for (const u of updates) {
-        try {
-          console.log(`[CLIENT ${id}] messages.update: key=${u.key?.id || 'n/a'} status=${u.status || 'n/a'} type=${u.update?.status || 'n/a'}`, u);
-        } catch (err) {
-          console.debug(`[CLIENT ${id}] messages.update logging falhou: ${err.message}`);
-        }
-      }
-    });
-
-    client.ev.on('presence.update', (p) => {
-      console.log(`[CLIENT ${id}] presence.update:`, p);
-    });
-
-    client.ev.on('chats.set', (c) => {
-      console.log(`[CLIENT ${id}] chats.set: total=${c.length}`);
-    });
+    client.ev.on('messages.upsert', () => {}); // Evita erro de evento não tratado
 
   } catch (error) {
     console.error(`[CLIENT ${id}] Erro crítico ao criar socket: ${error.message}`);
     creatingQr.delete(id);
     clearSessionDir(sessionPath);
-    // Remove qualquer cliente parcialmente criado
-    if (clients.has(id)) clients.delete(id);
     throw error;
   }
 
@@ -275,61 +220,119 @@ const initializeClient = async (clinicId) => {
   return client;
 };
 
-// --- Envio de Mensagem ---
+
+// --- Envio de Mensagem (COM 3 TENTATIVAS - CORRIGIDO) ---
 const sendMessage = async (clinicId, number, message) => {
   const id = clinicId.toString();
-  let client = clients.get(id);
-  let currentStatus = getClientStatus(id);
+  const MAX_RETRIES = 3; // 3 tentativas
 
-  console.log(`[SEND ${id}] Tentando enviar para ${number}. Status inicial: ${currentStatus}`);
-
-  // Aguarda conexão
+  // --- Helper de conexão (do arquivo original) ---
   const waitForConnection = async () => {
-    const maxWait = 15000;
+    let client = clients.get(id);
+    let currentStatus = getClientStatus(id);
+    const maxWait = 15000; // 15s
     const start = Date.now();
+    
+    console.log(`[WAIT ${id}] Aguardando conexão. Status: ${currentStatus}`);
+
     while (Date.now() - start < maxWait) {
       currentStatus = getClientStatus(id);
-      if (currentStatus === 'connected') break;
-      if (currentStatus === 'disconnected') {
-        if (client) await logoutAndRemoveClient(id);
-        // inicia (não await a chamada se quiser background init) — aqui aguardamos para garantir conn
-        await initializeClient(clinicId);
+      if (currentStatus === 'connected') {
+          console.log(`[WAIT ${id}] Conectado.`);
+          return clients.get(id); // Retorna o cliente conectado
       }
+      
+      if (currentStatus === 'disconnected') {
+        console.log(`[WAIT ${id}] Cliente desconectado. Iniciando reconexão...`);
+        // Aqui não precisamos limpar, apenas inicializar
+        // A initializeClient já verifica se existe (clients.has(id))
+        if (clients.has(id)) {
+           console.warn(`[WAIT ${id}] Cliente existe mas está desconectado. Limpando da memória.`);
+           cleanupClientMemory(id); // Limpa só da memória
+        }
+
+        try {
+             await initializeClient(clinicId); // Tenta inicializar usando a sessão do disco
+        } catch (initError) {
+            console.error(`[WAIT ${id}] Falha ao iniciar cliente durante espera: ${initError.message}`);
+            throw new Error(`Falha ao reiniciar cliente: ${initError.message}`);
+        }
+      }
+      
       await new Promise(r => setTimeout(r, 1000));
     }
+    
+    // Timeout
     currentStatus = getClientStatus(id);
     if (currentStatus !== 'connected') {
       throw new Error(`Timeout: Cliente não conectou após ${maxWait}ms. Status: ${currentStatus}`);
     }
+    return clients.get(id);
   };
+  // --- Fim do helper ---
 
-  if (currentStatus !== 'connected') {
-    console.log(`[SEND ${id}] Cliente não conectado. Aguardando...`);
-    await waitForConnection();
-  }
 
-  client = clients.get(id);
-  if (!client || !client.user) {
-    throw new Error("Cliente não está conectado ou não autenticado.");
-  }
+  // --- Início do Loop de Tentativas ---
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    console.log(`[SEND ${id}] Tentativa ${attempt}/${MAX_RETRIES} para ${number}.`);
+    
+    let client;
+    try {
+      let currentStatus = getClientStatus(id);
+      if (currentStatus !== 'connected') {
+        console.log(`[SEND ${id}] Não conectado (Status: ${currentStatus}). Acionando waitForConnection...`);
+        client = await waitForConnection(); 
+      } else {
+        client = clients.get(id); // Pega o cliente já conectado
+      }
 
-  const chatId = number.endsWith('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
+      if (!client || !client.user) {
+        throw new Error("Cliente não está conectado ou não autenticado após espera.");
+      }
 
-  try {
-    console.log(`[SEND ${id}] Enviando para ${chatId}...`);
-    const result = await client.sendMessage(chatId, { text: message });
-    console.log(`[SEND ${id}] Mensagem enviada com sucesso. ID: ${result.key?.id || 'n/a'}`);
-    return result;
-  } catch (error) {
-    console.error(`[SEND ${id}] Falha ao enviar mensagem:`, error.message || error);
-    // Se erro de login/conn, limpa cliente para forçar reauth no próximo envio
-    if ((error.message && error.message.includes('not logged in')) || (error.message && error.message.includes('connection closed'))) {
-      try { await logoutAndRemoveClient(clinicId); } catch (e) { /* ignora */ }
+      const chatId = number.endsWith('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
+
+      console.log(`[SEND ${id}] Enviando para ${chatId} (Tentativa ${attempt})...`);
+      
+      const result = await client.sendMessage(chatId, { text: message });
+      
+      console.log(`[SEND ${id}] Mensagem enviada com sucesso. ID: ${result.key?.id || 'n/a'}`);
+      return result; // SUCESSO!
+
+    } catch (error) {
+      console.warn(`[SEND ${id}] Erro na tentativa ${attempt}:`, error.message || error);
+      
+      const errorMsg = (error.message || '').toLowerCase();
+      const isConnectionError = errorMsg.includes('not logged in') || 
+                                errorMsg.includes('connection closed') || 
+                                errorMsg.includes('disconnected') ||
+                                errorMsg.includes('timeout') || 
+                                errorMsg.includes('cliente não conectou');
+
+      if (isConnectionError) {
+        console.warn(`[SEND ${id}] Erro de conexão detectado. Limpando cliente DA MEMÓRIA.`);
+        
+        // **A MUDANÇA CRÍTICA ESTÁ AQUI**
+        // Não usamos mais logoutAndRemoveClient, que apaga a sessão.
+        // Usamos a função leve que só limpa a memória.
+        cleanupClientMemory(clinicId); 
+        
+        if (attempt === MAX_RETRIES) {
+          console.error(`[SEND ${id}] Falha final após ${MAX_RETRIES} tentativas.`);
+          throw new Error(`Falha ao enviar mensagem após ${MAX_RETRIES} tentativas: ${error.message || String(error)}`);
+        }
+        
+        await new Promise(r => setTimeout(r, 2000)); // Espera antes de tentar de novo
+        
+      } else {
+        // Erro não recuperável (ex: número inválido)
+        console.error(`[SEND ${id}] Erro não recuperável. Parando tentativas.`);
+        throw error; 
+      }
     }
-    throw new Error(`Falha ao enviar mensagem: ${error.message || String(error)}`);
   }
+  // --- Fim do Loop de Tentativas ---
 };
-
 // --- Admin helpers ---
 const initializeAdminClient = async () => {
   console.log(`[CLIENT ${ADMIN_CLIENT_ID}] Inicializando cliente admin...`);
@@ -391,5 +394,6 @@ module.exports = {
 
   // Exports novos
   getConn,
+  cleanupClientMemory,
   getClientEntry,
 };
